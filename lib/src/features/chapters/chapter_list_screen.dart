@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../core/convert/queue_client.dart';
 import '../../core/parse/parse_client.dart';
 import '../app_providers.dart';
 
@@ -31,6 +34,101 @@ class _ChapterListScreenState extends ConsumerState<ChapterListScreen> {
 
   /// Da prefetch trang ke sau lan hien thi dau (tranh lap lai moi build).
   int _prefetchedFor = -1;
+
+  /// v14: dang tao queue convert nen (disable nut tranh bam lap).
+  bool _dangTaoQueue = false;
+
+  /// v14: timer poll tien do queue 5s/lan. Huy khi roi man hinh.
+  Timer? _pollQueue;
+
+  @override
+  void dispose() {
+    _pollQueue?.cancel();
+    super.dispose();
+  }
+
+  /// v14: tao queue convert nen full truyen (toi da 200 chuong/lan) roi
+  /// poll 5s/lan cap nhat [queueProgressProvider]. Chuong nao xong nghe
+  /// ngay qua player nhu cu (audio da co san trong proxy).
+  Future<void> _taiFullTruyenNen(ParseResult result) async {
+    if (_dangTaoQueue || result.storyUrl.isEmpty) return;
+    setState(() => _dangTaoQueue = true);
+    try {
+      final queue = ref.read(queueClientProvider);
+      // Convert tu trang hien tai den het (toi da 200 chuong/lan — truyen
+      // 1k chuong user bam tiep de tai dot sau).
+      final tao = await queue.taoQueue(
+        result.storyUrl,
+        fromPage: result.hasPaging ? result.page : 1,
+        toPage: result.hasPaging ? result.maxPage : 1,
+        limit: 200,
+      );
+      ref.read(queueIdProvider.notifier).state = tao.queueId;
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Đã gửi ${tao.total} chương vào hàng đợi nền. '
+            'Chương nào xong nghe ngay.',
+          ),
+        ),
+      );
+      _pollQueue?.cancel();
+      _pollQueue = Timer.periodic(
+        Duration(seconds: const QueueProgress(
+          queueId: '',
+          status: '',
+          done: 0,
+          total: 0,
+          chuongXong: [],
+          hong: [],
+        ).pollSeconds),
+        (_) => _pollMotLan(tao.queueId),
+      );
+      await _pollMotLan(tao.queueId);
+    } on DioException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Không tạo được hàng đợi: ${e.message ?? e.type.name}')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Không tạo được hàng đợi: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _dangTaoQueue = false);
+    }
+  }
+
+  /// v14: poll 1 lan tien do queue; xong thi dung timer.
+  Future<void> _pollMotLan(String queueId) async {
+    try {
+      final progress =
+          await ref.read(queueClientProvider).layTienDo(queueId);
+      ref.read(queueProgressProvider.notifier).state = progress;
+      if (progress.hoanTat) {
+        _pollQueue?.cancel();
+        if (mounted) {
+          final hong = progress.hong;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                hong.isEmpty
+                    ? 'Tải nền xong ${progress.done}/${progress.total} chương.'
+                    : 'Tải nền xong ${progress.done}/${progress.total} chương '
+                        '(${hong.length} chương lỗi, chạm để thử lại từng chương).',
+              ),
+            ),
+          );
+        }
+      }
+    } catch (_) {
+      // Poll hong 1 lan -> bo qua, lan sau poll tiep (khong pha UI).
+    }
+  }
 
   Future<void> _chuyenTrang(int page) async {
     final result = ref.read(parseResultProvider);
@@ -141,6 +239,21 @@ class _ChapterListScreenState extends ConsumerState<ChapterListScreen> {
           onPressed: () => context.go('/'),
         ),
         actions: [
+          // v14: nut tai full truyen nen (queue toi da 200 chuong/lan,
+          // poll 5s/lan). Disable khi dang tao hoac chua co storyUrl.
+          IconButton(
+            tooltip: 'Tải full truyện nền',
+            icon: _dangTaoQueue
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.cloud_download_outlined),
+            onPressed: (_dangTaoQueue || result.storyUrl.isEmpty)
+                ? null
+                : () => _taiFullTruyenNen(result),
+          ),
           IconButton(
             tooltip: 'Nghe từ đầu',
             icon: const Icon(Icons.playlist_play),
@@ -150,6 +263,10 @@ class _ChapterListScreenState extends ConsumerState<ChapterListScreen> {
       ),
       body: Column(
         children: [
+          // v14: thanh progress tong cua queue nen (x/total chuong).
+          // Hien ngay khi co queue, an khi xong. Chuong nao xong nghe
+          // ngay (audio san trong proxy, player tai nhu cu).
+          _QueueProgressBar(),
           if (result.hasPaging) _PhanTrangBar(
             page: result.page,
             maxPage: result.maxPage,
@@ -246,6 +363,77 @@ class _ChapterListScreenState extends ConsumerState<ChapterListScreen> {
   void _openPlayer(BuildContext context, WidgetRef ref, int index) {
     ref.read(currentChapterIndexProvider.notifier).state = index;
     context.go('/player');
+  }
+}
+
+/// v14: thanh progress tong cua queue convert nen (audit ui-ux-pro-max:
+/// multi-step flow phai hien step + progress + ETA).
+///
+/// - Chua co queue ([queueProgressProvider] null) -> an (SizedBox.shrink,
+///   khong gay nhay layout).
+/// - Dang chay: `Đã tải nền x/total chương` + LinearProgressIndicator +
+///   so chuong loi (neu co).
+/// - Xong: hien 1 dong xac nhan xanh (an sau khi user doi truyen).
+class _QueueProgressBar extends ConsumerWidget {
+  const _QueueProgressBar();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final progress = ref.watch(queueProgressProvider);
+    if (progress == null) return const SizedBox.shrink();
+    final pct = progress.tiLe;
+    final pctLabel = (pct * 100).toStringAsFixed(0);
+    return Semantics(
+      label: 'Tiến độ tải nền: ${progress.done} trên ${progress.total} chương',
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        color: progress.hoanTat
+            ? Theme.of(context).colorScheme.primaryContainer.withValues(alpha: 0.35)
+            : Theme.of(context).colorScheme.secondaryContainer.withValues(alpha: 0.5),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  progress.hoanTat
+                      ? Icons.check_circle_outline
+                      : Icons.cloud_download_outlined,
+                  size: 18,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    progress.hoanTat
+                        ? 'Tải nền xong ${progress.done}/${progress.total} chương'
+                        : 'Đang tải nền ${progress.done}/${progress.total} chương ($pctLabel%)',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ),
+                if (progress.hong.isNotEmpty)
+                  Text(
+                    '${progress.hong.length} lỗi',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            // Giu chieu cao co dinh de khong nhay layout khi % doi.
+            SizedBox(
+              height: 6,
+              child: progress.hoanTat
+                  ? const SizedBox.shrink()
+                  : LinearProgressIndicator(value: pct),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 

@@ -276,11 +276,14 @@ class PlayerScreenState extends ConsumerState<PlayerScreen> {
       } on TimeoutException {
         // v10: play() treo sau khi playlist da nap -> audio san sang.
         // Controls da hien o tren (state paused); user bam phat lai.
-        // Giu loi lam notice (khong chan UI) thay vi man hinh loi.
+        // v14 (fix user bao "khong tu phat" — that ra browser CHAN
+        // autoplay, khong phai loi): message noi RO NGUYEN NHAN + cach
+        // xu ly, cam dung tu "that bai" gay hieu lam loi. Nhan manh audio
+        // da san sang, chi can 1 cham.
         if (alive()) {
           setState(() {
-            _error = 'Audio đã sẵn sàng nhưng tự phát thất bại. '
-                'Hãy bấm nút Phát.';
+            _error = 'Trình duyệt chặn tự phát nên audio đang chờ. '
+                'Audio đã sẵn sàng — hãy bấm Phát để nghe.';
           });
         }
       }
@@ -667,6 +670,17 @@ class _ControlsView extends ConsumerStatefulWidget {
 }
 
 class _ControlsViewState extends ConsumerState<_ControlsView> {
+  // v14: nut Phat tu dong focus khi hien (user bao "khong tu phat" —
+  // browser chan autoplay nen can 1 cham; focus san giup bam Enter/
+  // Space hoac Tab thay ngay, khong phai mo tim nut).
+  final FocusNode _nutPhatFocus = FocusNode();
+
+  @override
+  void dispose() {
+    _nutPhatFocus.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<PlayerStateSnapshot>(
@@ -790,6 +804,10 @@ class _ControlsViewState extends ConsumerState<_ControlsView> {
                     minimumSize: const Size(72, 72),
                     padding: const EdgeInsets.all(16),
                   ),
+                  // v14: autofocus khi hien (khi play() bi browser chan,
+                  // nut Phat da focus san — bam Enter/Space la nghe ngay).
+                  focusNode: _nutPhatFocus,
+                  autofocus: true,
                   onPressed: () => playing
                       ? widget.handler.pause()
                       : widget.handler.play(),

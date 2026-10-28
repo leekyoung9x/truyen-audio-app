@@ -594,6 +594,127 @@ async def _voices_kokoro() -> Response:
     return await _pipe_json("GET", f"{KOKORO_BASE}/voices", timeout=TIMEOUT_VOICES)
 
 
+# ---------------------------------------------------------------------------
+# v14 helpers: boc SACH noi dung chuong — cat menu/nut rac.
+#
+# Van de (Lead QA live B2.5, 2026-10-28): server 8001 boc text CA TRANG
+# (menu DANH SACH/THE LOAI + nut "Chuong truoc/tiep" + "Tai Ebook") nen
+# TTS doc rac. Noi dung sach nam trong `div.vung-doc#vungdoc`, nhung can
+# cat nut dieu huong dau/cuoi.
+#
+# Ranh gioi da xac minh bang curl + boc `div#vungdoc` (2026-10-28):
+#   div#vungdoc > div.truyen ... [NOI DUNG SACH] ... div.chapter_wrap.control-last
+# Rac can loai: 2x div.chapter_control, button#download-book,
+# link "Chuong truoc/tiep", "Tai Ebook", "Cai dat giao dien".
+# ---------------------------------------------------------------------------
+
+# Cum tu rac xuat hien trong nut/link dieu huong (dong < 60 ky tu moi loc).
+_RAC_CHUONG = (
+    "Chương trước",
+    "Chương tiếp",
+    "《 Chương",
+    "Chương 》",
+    "Tải Ebook",
+    "Cài đặt giao diện",
+    "Danh sách chương",
+)
+
+# Regex cat khoi chapter_control / download-book truoc khi strip tags.
+_CHAPTER_CONTROL_RE = re.compile(
+    r'<div[^>]*class\s*=\s*["\'][^"\']*chapter_control[^"\']*["\'][^>]*>'
+    r".*?</div>",
+    re.IGNORECASE | re.DOTALL,
+)
+_DOWNLOAD_BOOK_RE = re.compile(
+    r'<button[^>]*id\s*=\s*["\']download-book["\'].*?</button>',
+    re.IGNORECASE | re.DOTALL,
+)
+_VUNGDOC_RE = re.compile(
+    r'<div[^>]*\bid\s*=\s*["\']vungdoc["\'][^>]*>', re.IGNORECASE
+)
+_VUNGDOC_CLASS_RE = re.compile(
+    r'<div[^>]*\bclass\s*=\s*["\'][^"\']*vung-doc[^"\']*["\'][^>]*>',
+    re.IGNORECASE,
+)
+_TITLE_CHUONG_RE = re.compile(
+    r'<h2[^>]*class\s*=\s*["\'][^"\']*current-chapter[^"\']*["\'][^>]*>'
+    r"(.*?)</h2>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_tags_ve_text(html_doan: str) -> str:
+    """Strip tags -> text sach (unescape entities, chuan hoa newline)."""
+    s = _CHAPTER_CONTROL_RE.sub(" ", html_doan)
+    s = _DOWNLOAD_BOOK_RE.sub(" ", s)
+    s = re.sub(r"<script.*?</script>", " ", s, flags=re.I | re.S)
+    s = re.sub(r"<style.*?</style>", " ", s, flags=re.I | re.S)
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"</p\s*>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = _html.unescape(s)
+    s = re.sub(r"[ \t\xa0]+", " ", s)
+    s = re.sub(r"\n\s*\n\s*\n+", "\n\n", s).strip()
+    lines = [ln.strip() for ln in s.split("\n")]
+    # Loc dong rac con sot (nut/link dieu huong, dong qua ngan).
+    sach = [
+        ln
+        for ln in lines
+        if ln and not any(r in ln and len(ln) < 60 for r in _RAC_CHUONG)
+    ]
+    return "\n".join(sach)
+
+
+def _sach_noi_dung_chuong(html_trang: str) -> tuple[str, str]:
+    """Boc (title, text-sach) tu HTML trang chuong metruyenchu.
+
+    - Tim `div#vungdoc` (fallback `div.vung-doc`); khong thay -> ("","").
+    - Title tu `h2.current-chapter` (fallback `h1`).
+    - Noi dung tu `div.truyen` den truoc `control-last` (cat nut 2 dau);
+      fallback: toan bo div#vungdoc da loai chapter_control/download-book.
+    - Tra ("","") neu khong boc duoc gi de caller forward 8001 nhu cu.
+    """
+    m = _VUNGDOC_RE.search(html_trang or "")
+    if not m:
+        m = _VUNGDOC_CLASS_RE.search(html_trang or "")
+    if not m:
+        return "", ""
+    seg = html_trang[m.end() : m.end() + 60000]
+    title = ""
+    tm = _TITLE_CHUONG_RE.search(seg)
+    if not tm:
+        tm = re.search(r"<h1[^>]*>(.*?)</h1>", seg, re.I | re.S)
+    if tm:
+        title = re.sub(r"<[^>]+>", "", tm.group(1))
+        title = re.sub(r"\s+", " ", _html.unescape(title)).strip()
+    start = seg.find('div class="truyen"')
+    if start < 0:
+        start = seg.find('class="truyen"')
+    end = seg.find("control-last")
+    if start >= 0:
+        gt = seg.find(">", start)
+        body = seg[gt + 1 : end if end > gt else gt + 30000]
+    else:
+        body = seg[:30000]
+    text = _strip_tags_ve_text(body)
+    if not text:
+        return "", ""
+    full = f"{title}\n\n{text}".strip() if title else text
+    return title, full
+
+
+async def _parse_chuong_sach(url_chuong: str) -> Optional[tuple[str, str]]:
+    """Fetch HTML chuong + boc sach. Tra (title, text) hoac None neu hong."""
+    client = _client_or_new()
+    html_trang = await _fetch_text(client, url_chuong, referer=url_chuong)
+    if not html_trang:
+        return None
+    title, full = _sach_noi_dung_chuong(html_trang)
+    if not full:
+        return None
+    return title, full
+
+
 async def _parse(request: Request) -> Response:
     try:
         body = await request.json()
@@ -619,9 +740,32 @@ async def _parse(request: Request) -> Response:
         except (TypeError, ValueError):
             page = 1
         return await _boc_toc(url.strip(), page=max(1, page))
-    return await _pipe_json(
+    # v14: url chuong cu the -> boc SACH div#vungdoc truoc (cat menu/nut
+    # rac ma 8001 dang boc ca trang); neu boc sach that bai (site doi cau
+    # truc, fetch hong) moi forward 8001 nhu cu. Header X-Clean: 1 = boc
+    # sach noi bo, 0 = forward 8001 (de debug).
+    if (
+        isinstance(url, str)
+        and url.strip()
+        and (not isinstance(text, str) or not text.strip())
+        and _is_chapter_url(url.strip())
+    ):
+        sach = await _parse_chuong_sach(url.strip())
+        if sach is not None:
+            title, full = sach
+            return JSONResponse(
+                {
+                    "chapters": [{"title": title, "url": url.strip(), "len": len(full)}],
+                    "texts": [full],
+                },
+                headers={"X-Clean": "1"},
+            )
+    resp = await _pipe_json(
         "POST", f"{VIENEU_BASE}/parse", body=body, timeout=TIMEOUT_PARSE
     )
+    # v14: forward 8001 -> danh dau X-Clean: 0 (de app/log biet text chua sach).
+    resp.headers["X-Clean"] = "0"
+    return resp
 
 
 def _toc_page_cua(request: Request) -> int:
@@ -1016,6 +1160,280 @@ async def _tts_chunk_mot(request: Request) -> Response:
     )
 
 
+# ---------------------------------------------------------------------------
+# v14: queue convert NEN full truyen.
+#
+# Van de (user bao 2026-10-28): moi convert khi bam tung chuong (prefetch
+# 2 chuong ke), khong convert full truyen. Fix: worker nen fetch text sach
+# tung chuong -> goi TTS chunk -> cache RAM theo url chuong; app poll
+# `GET /api/queue/{id}` 5s/lan hien progress tong (x/200 chuong).
+# Chuong nao xong app tai ngay qua /tts_chunk nhu cu (cache proxy RAM).
+#
+# Gioi han (Trail of Bits: queue abuse): toi da 3 queue dong thoi, moi
+# queue toi da 200 chuong/lan (truyen 1k chuong chia nhieu lan).
+# ---------------------------------------------------------------------------
+
+import uuid as _uuid
+
+QUEUE_MAX_DONG_THOI = 3
+QUEUE_MAX_CHUONG = 200
+QUEUE_POLL_GIY = 5  # app poll moi 5s (ghi vao response de app biet)
+
+# Cache audio nen theo url chuong {url: bytes-mp3} (app tai qua /tts_chunk
+# nhu cu — van dung chung _tts_chunked/_kokoro_mot_chunk nen khong can
+# luu rieng; queue chi can biet chuong nao XONG de app goi /tts_chunk).
+_QUEUE: dict[str, dict[str, Any]] = {}
+_QUEUE_KHOA = asyncio.Lock()
+
+# Gioi han RAM queue: toi da 200 chuong x ~15000 chu (tran TTS_TEXT_MAX).
+# Worker cat dung split_text_chunks (target 400) nen khong dot bien RAM.
+
+
+async def _queue_synth_chuong(
+    client: httpx.AsyncClient,
+    full: str,
+    kokoro_voice: str = "diem_trinh",
+    vieneu_voice: str = "Trúc Ly",
+) -> Optional[bytes]:
+    """Tong hop 1 chuong sach -> MP3 (dung chung cho worker queue).
+
+    - Text ngan (<=5000 chu, 1 chunk): 1 shot Kokoro.
+    - Dai: cat chunk ~400 chu, synth SONG SONG (sem TTS_CHUNK_PARALLEL=2,
+      giong _tts_chunked — Kokoro box single-flight, fan-out cao gay
+      death spiral), chunk hong -> fallback Vieneu.
+    - Tra bytes MP3 hoac None (caller danh dau hong, di tiep).
+    """
+    if len(full) > TTS_TEXT_MAX:
+        full = full[:TTS_TEXT_MAX]
+    chunks = split_text_chunks(full)
+    if len(chunks) <= 1 and len(full) <= 5000:
+        return await _kokoro_mot_chunk(client, full, kokoro_voice, 1.0)
+    sem = asyncio.Semaphore(TTS_CHUNK_PARALLEL)
+
+    async def _mot(c: str) -> Optional[bytes]:
+        async with sem:
+            d = await _kokoro_mot_chunk(client, c, kokoro_voice, 1.0)
+            if d is None:
+                d = await _vieneu_mot_chunk(client, c, vieneu_voice)
+            return d
+
+    parts = await asyncio.gather(*(_mot(c) for c in chunks))
+    if any(p is None for p in parts):
+        return None
+    return b"".join(p for p in parts if p)
+
+
+async def _queue_worker(
+    qid: str,
+    chapters: list[dict[str, str]],
+) -> None:
+    """Worker nen: fetch text sach tung chuong -> TTS chunk -> luu RAM.
+
+    Chay nen qua asyncio.create_task; cap nhat tien do vao _QUEUE[qid].
+    Loi 1 chuong -> danh dau hong, di tiep chuong sau (khong dung ca queue).
+    """
+    client = _client_or_new()
+    async with _QUEUE_KHOA:
+        q = _QUEUE.get(qid)
+        if q is None:
+            return
+        q["status"] = "running"
+    for i, ch in enumerate(chapters):
+        async with _QUEUE_KHOA:
+            q = _QUEUE.get(qid)
+            if q is None or q.get("status") == "cancelled":
+                return
+        url = ch.get("url", "")
+        title = ch.get("title", f"chuong {i + 1}")
+        try:
+            sach = await _parse_chuong_sach(url)
+            if sach is None:
+                raise RuntimeError("khong boc duoc text sach")
+            data = await _queue_synth_chuong(client, sach[1])
+            async with _QUEUE_KHOA:
+                q = _QUEUE.get(qid)
+                if q is None:
+                    return
+                if data:
+                    q["audios"][url] = data
+                    q["done"] += 1
+                    q["chuong_xong"].append(title)
+                else:
+                    q["hong"].append(title)
+        except Exception as e:  # noqa: BLE001 — queue khong duoc chet vi 1 chuong
+            log.warning("queue %s chuong %s loi: %s", qid, title, e)
+            async with _QUEUE_KHOA:
+                q = _QUEUE.get(qid)
+                if q is None:
+                    return
+                q["hong"].append(title)
+        async with _QUEUE_KHOA:
+            q = _QUEUE.get(qid)
+            if q is None:
+                return
+            q["tien_do"] = q["done"] + len(q["hong"])
+    async with _QUEUE_KHOA:
+        q = _QUEUE.get(qid)
+        if q is not None and q.get("status") == "running":
+            q["status"] = "done"
+
+
+async def _queue_tao(request: Request) -> Response:
+    """POST /queue {story_url, from_page, to_page} -> {queue_id, total}."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body phai la JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body phai la object JSON"}, status_code=400)
+    story_url = str(body.get("story_url", "") or "").strip()
+    if not story_url:
+        return JSONResponse({"error": "thieu 'story_url'"}, status_code=400)
+    try:
+        parts = urlsplit(story_url)
+    except ValueError:
+        return JSONResponse({"error": "URL truyen khong hop le"}, status_code=400)
+    host = parts.hostname or ""
+    if parts.scheme not in ("http", "https") or not host:
+        return JSONResponse(
+            {"error": "URL truyen phai bat dau bang http:// hoac https://"},
+            status_code=400,
+        )
+    if _host_bi_chan(host):
+        return JSONResponse(
+            {"error": "URL tro toi host noi bo, khong duoc phep fetch"},
+            status_code=403,
+        )
+    if _toc_parser_name(host) is None:
+        return JSONResponse(
+            {"error": f"chua ho tro boc muc luc site {host}"}, status_code=422
+        )
+    try:
+        from_page = max(1, int(body.get("from_page", 1)))
+        to_page = max(1, int(body.get("to_page", 1)))
+        # v14: limit so chuong toi da (nghiem thu nhanh 5 chuong dau;
+        # production truyen 1k chuong chia nhieu lan, tran QUEUE_MAX_CHUONG).
+        limit = int(body.get("limit", QUEUE_MAX_CHUONG))
+        limit = max(1, min(limit, QUEUE_MAX_CHUONG))
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"error": "'from_page'/'to_page'/'limit' phai la so"},
+            status_code=400,
+        )
+    if from_page > to_page:
+        from_page, to_page = to_page, from_page
+    async with _QUEUE_KHOA:
+        dang_chay = sum(
+            1 for q in _QUEUE.values() if q.get("status") in ("queued", "running")
+        )
+        if dang_chay >= QUEUE_MAX_DONG_THOI:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"dang co {dang_chay} queue chay "
+                        f"(toi da {QUEUE_MAX_DONG_THOI}), hay doi"
+                    )
+                },
+                status_code=429,
+            )
+    # Lay TOC cac page de ra danh sach chuong (tai su dung _boc_toc_1_page).
+    client = _client_or_new()
+    chapters: list[dict[str, str]] = []
+    try:
+        for page in range(from_page, to_page + 1):
+            resp = await asyncio.wait_for(
+                _boc_toc_1_page(client, story_url, host, page),
+                timeout=TIMEOUT_TOC_TOTAL,
+            )
+            if resp.status_code != 200:
+                break
+            import json as _json
+
+            data = _json.loads(bytes(resp.body).decode("utf-8"))
+            for c in data.get("chapters", []) or []:
+                chapters.append(
+                    {"title": c.get("title", ""), "url": c.get("url", "")}
+                )
+            if len(chapters) >= limit:
+                break
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            {"error": "site truyen phan hoi qua cham (>40s), hay thu lai"},
+            status_code=504,
+        )
+    chapters = [c for c in chapters if c.get("url")][:limit]
+    if not chapters:
+        return JSONResponse(
+            {"error": "khong lay duoc muc luc cac trang nay"}, status_code=502
+        )
+    qid = _uuid.uuid4().hex[:12]
+    async with _QUEUE_KHOA:
+        _QUEUE[qid] = {
+            "status": "queued",
+            "story_url": story_url,
+            "from_page": from_page,
+            "to_page": to_page,
+            "total": len(chapters),
+            "done": 0,
+            "tien_do": 0,
+            "chuong_xong": [],
+            "hong": [],
+            "audios": {},
+            "tao_luc": time.time(),
+        }
+    asyncio.create_task(_queue_worker(qid, chapters))
+    log.info("queue %s: %d chuong (%s p%d-%d)", qid, len(chapters), story_url, from_page, to_page)
+    return JSONResponse(
+        {
+            "queue_id": qid,
+            "total": len(chapters),
+            "poll_seconds": QUEUE_POLL_GIY,
+        }
+    )
+
+
+async def _queue_tien_do(request: Request) -> Response:
+    """GET /queue/{qid} -> {done, total, chuong_xong, hong, status}."""
+    qid = request.path_params.get("qid", "")
+    async with _QUEUE_KHOA:
+        q = _QUEUE.get(qid)
+        if q is None:
+            return JSONResponse(
+                {"error": f"khong tim thay queue {qid}"}, status_code=404
+            )
+        return JSONResponse(
+            {
+                "queue_id": qid,
+                "status": q["status"],
+                "done": q["done"],
+                "total": q["total"],
+                "tien_do": q["tien_do"],
+                "chuong_xong": list(q["chuong_xong"][-10:]),
+                "hong": list(q["hong"]),
+                "poll_seconds": QUEUE_POLL_GIY,
+            }
+        )
+
+
+async def _queue_audio(request: Request) -> Response:
+    """GET /queue/{qid}/audio?url=<url-chuong> -> audio MP3 chuong da xong."""
+    qid = request.path_params.get("qid", "")
+    url = (request.query_params.get("url") or "").strip()
+    async with _QUEUE_KHOA:
+        q = _QUEUE.get(qid)
+        if q is None:
+            return JSONResponse(
+                {"error": f"khong tim thay queue {qid}"}, status_code=404
+            )
+        data = q["audios"].get(url)
+        if data is None:
+            return JSONResponse(
+                {"error": "chuong chua xong hoac khong co trong queue"},
+                status_code=404,
+            )
+    return Response(content=bytes(data), media_type="audio/mpeg")
+
+
 # Route chinh (sau khi Caddy strip /api) + alias giu prefix (test truc tiep).
 for _route, _handler, _methods in [
     ("/voices/vieneu", _voices_vieneu, ["GET"]),
@@ -1024,9 +1442,16 @@ for _route, _handler, _methods in [
     ("/toc", _toc, ["GET"]),
     ("/tts", _tts, ["POST"]),
     ("/tts_chunk", _tts_chunk_mot, ["POST"]),
+    ("/queue", _queue_tao, ["POST"]),
 ]:
     app.add_api_route(_route, _handler, methods=_methods)  # type: ignore[arg-type]
     app.add_api_route(f"/api{_route}", _handler, methods=_methods)  # type: ignore[arg-type]
+
+# Queue progress/audio co path param -> dang ky rieng (khong di chung loop).
+app.add_api_route("/queue/{qid}", _queue_tien_do, methods=["GET"])
+app.add_api_route("/api/queue/{qid}", _queue_tien_do, methods=["GET"])
+app.add_api_route("/queue/{qid}/audio", _queue_audio, methods=["GET"])
+app.add_api_route("/api/queue/{qid}/audio", _queue_audio, methods=["GET"])
 
 
 @app.on_event("shutdown")

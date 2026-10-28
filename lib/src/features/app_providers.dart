@@ -1,6 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/cache/audio_cache.dart';
+import '../core/convert/queue_client.dart';
 import '../core/parse/parse_client.dart';
 import '../core/tts/fallback_chain.dart';
 import '../core/tts/kokoro_provider.dart';
@@ -9,6 +10,16 @@ import '../core/tts/vieneu_provider.dart';
 // --- Core singletons ---
 
 final parseClientProvider = Provider<ParseClient>((ref) => ParseClient());
+
+/// v14: client queue convert nen full truyen.
+final queueClientProvider = Provider<QueueClient>((ref) => QueueClient());
+
+/// v14: tien do queue hien tai (null = chua tao queue). App poll 5s/lan
+/// cap nhat provider nay de thanh progress tong (x/200 chuong) hien lien.
+final queueProgressProvider = StateProvider<QueueProgress?>((ref) => null);
+
+/// v14: queue_id dang chay (de poll tiep khi chuyen man hinh). '' = khong co.
+final queueIdProvider = StateProvider<String>((ref) => '');
 
 final vieneuProvider = Provider<VieneuProvider>((ref) => VieneuProvider());
 
