@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:io' show Directory, File;
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart'
-    show Uint8List, immutable, kIsWeb, visibleForTesting;
+    show Uint8List, debugPrint, immutable, kIsWeb, visibleForTesting;
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -100,21 +100,48 @@ class AudioCache {
   ///
   /// Web: khong goi path_provider / Directory / File (stub -> throw),
   /// chi mo 2 Hive box (metadata + bytes).
+  ///
+  /// v15 fail-open: bat ky buoc nao throw (Hive hong, storage loi) thi tra
+  /// ve [memory] thay vi nem — app van vao duoc, cache chay tren RAM.
   static Future<AudioCache> init() async {
-    final box = await Hive.openBox<dynamic>(boxName);
-    if (kIsWeb) {
-      final blobBox = await Hive.openBox<dynamic>(blobBoxName);
-      return AudioCache._(null, box, blobBox);
+    try {
+      if (!kIsWeb) {
+        // Pre-flight: Hive chua init (homePath null) -> boxExists nem
+        // ArgumentError sach (khong orphan) -> roi vao catch -> memory.
+        // Khong goi openBox khi chac chan fail: openBox fail vua rethrow
+        // vua completeError vao future noi bo `_openingBoxes` (khong ai
+        // listen) -> loi thu 2 thanh unhandled async, fail test du catch
+        // da xu ly xong. (Da kiem chung: boc openBox trong runZoned
+        // lam future treo, khong dung.)
+        await Hive.boxExists(boxName);
+      }
+      final box = await Hive.openBox<dynamic>(boxName);
+      if (kIsWeb) {
+        final blobBox = await Hive.openBox<dynamic>(blobBoxName);
+        return AudioCache._(null, box, blobBox);
+      }
+      final appDir = await getApplicationDocumentsDirectory();
+      // Chuan hoa: bo '/' thua o cuoi de noi path khong bi '//'.
+      final cleanPath =
+          '${appDir.path}/audio_cache'.replaceAll(RegExp(r'/+$'), '');
+      final dir = Directory(cleanPath);
+      if (!await dir.exists()) {
+        await dir.create(recursive: true);
+      }
+      return AudioCache._(dir, box);
+    } catch (e) {
+      debugPrint('[cache] AudioCache.init fallback memory: $e');
+      return AudioCache.memory();
     }
-    final appDir = await getApplicationDocumentsDirectory();
-    // Chuan hoa: bo '/' thua o cuoi de noi path khong bi '//'.
-    final cleanPath =
-        '${appDir.path}/audio_cache'.replaceAll(RegExp(r'/+$'), '');
-    final dir = Directory(cleanPath);
-    if (!await dir.exists()) {
-      await dir.create(recursive: true);
-    }
-    return AudioCache._(dir, box);
+  }
+
+  /// Cache RAM thuan (fallback khi Hive khong mo duoc).
+  ///
+  /// Dung 2 [_MemoryBox] (che do blob nhu Web): khong doc/ghi disk, mat
+  /// khi tat app — nhung lookup/store/remove/clear + phat audio van chay
+  /// binh thuong nen khong chan khoi dong.
+  static AudioCache memory() {
+    return AudioCache._(null, _MemoryBox(), _MemoryBox());
   }
 
   /// Tinh key md5(text + voice + speed). De public de test / tai su dung.
@@ -323,4 +350,146 @@ class AudioCache {
     await _blobBox?.clear();
     await _box.clear();
   }
+}
+
+/// Box Hive in-memory (fallback RAM khi khong mo duoc box that).
+///
+/// Chi ho tro cac op [AudioCache] that su dung (get/put/delete/clear +
+/// keys/values); op exotic: watch -> stream rong, compact/flush/close ->
+/// no-op. Mat khi tat app.
+class _MemoryBox implements Box<dynamic> {
+  final Map<dynamic, dynamic> _map = <dynamic, dynamic>{};
+  int _autoKey = 0;
+
+  @override
+  String get name => 'audio_memory';
+
+  @override
+  String? get path => null;
+
+  @override
+  bool get isOpen => true;
+
+  @override
+  bool get lazy => false;
+
+  @override
+  bool get isEmpty => _map.isEmpty;
+
+  @override
+  bool get isNotEmpty => _map.isNotEmpty;
+
+  @override
+  int get length => _map.length;
+
+  @override
+  Iterable<dynamic> get keys => _map.keys;
+
+  @override
+  Iterable<dynamic> get values => _map.values;
+
+  @override
+  dynamic get(dynamic key, {dynamic defaultValue}) =>
+      _map.containsKey(key) ? _map[key] : defaultValue;
+
+  @override
+  dynamic getAt(int index) => _map.values.elementAt(index);
+
+  @override
+  dynamic keyAt(int index) => _map.keys.elementAt(index);
+
+  @override
+  bool containsKey(dynamic key) => _map.containsKey(key);
+
+  @override
+  Map<dynamic, dynamic> toMap() => Map<dynamic, dynamic>.of(_map);
+
+  @override
+  Iterable<dynamic> valuesBetween({dynamic startKey, dynamic endKey}) {
+    return _map.entries.where((e) {
+      if (startKey != null && _compare(e.key, startKey) < 0) return false;
+      if (endKey != null && _compare(e.key, endKey) > 0) return false;
+      return true;
+    }).map((e) => e.value);
+  }
+
+  static int _compare(dynamic a, dynamic b) {
+    try {
+      return (a as Comparable).compareTo(b);
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  @override
+  Future<void> put(dynamic key, dynamic value) async {
+    _map[key] = value;
+  }
+
+  @override
+  Future<void> putAt(int index, dynamic value) async {
+    _map[keyAt(index)] = value;
+  }
+
+  @override
+  Future<void> putAll(Map<dynamic, dynamic> entries) async {
+    _map.addAll(entries);
+  }
+
+  @override
+  Future<int> add(dynamic value) async {
+    while (_map.containsKey(_autoKey)) {
+      _autoKey++;
+    }
+    _map[_autoKey] = value;
+    return _autoKey++;
+  }
+
+  @override
+  Future<Iterable<int>> addAll(Iterable<dynamic> values) async {
+    final keys = <int>[];
+    for (final v in values) {
+      keys.add(await add(v));
+    }
+    return keys;
+  }
+
+  @override
+  Future<void> delete(dynamic key) async {
+    _map.remove(key);
+  }
+
+  @override
+  Future<void> deleteAt(int index) async {
+    _map.remove(keyAt(index));
+  }
+
+  @override
+  Future<void> deleteAll(Iterable<dynamic> keys) async {
+    for (final k in keys) {
+      _map.remove(k);
+    }
+  }
+
+  @override
+  Future<int> clear() async {
+    final n = _map.length;
+    _map.clear();
+    return n;
+  }
+
+  @override
+  Future<void> close() async {}
+
+  @override
+  Future<void> compact() async {}
+
+  @override
+  Future<void> flush() async {}
+
+  @override
+  Future<void> deleteFromDisk() async => _map.clear();
+
+  @override
+  Stream<BoxEvent> watch({dynamic key}) => const Stream.empty();
 }

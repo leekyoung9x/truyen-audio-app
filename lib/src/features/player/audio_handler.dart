@@ -3,7 +3,8 @@ import 'dart:io' show File;
 
 import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
-import 'package:flutter/foundation.dart' show Uint8List, immutable, kIsWeb;
+import 'package:flutter/foundation.dart'
+    show Uint8List, debugPrint, immutable, kIsWeb;
 import 'package:just_audio/just_audio.dart';
 import 'package:rxdart/rxdart.dart';
 
@@ -320,9 +321,21 @@ class StoryAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
   /// Cau hinh audio session (Android/iOS): uu tien speech, xu ly ngat quang.
   ///
   /// Web: audio_session khong ho tro -> bo qua, khong throw.
+  ///
+  /// v15 fail-open: treo o AudioSession.instance = treo logo (main doi
+  /// truoc runApp). Timeout 8s + try/catch: fail thi log roi chay tiep
+  /// bang just_audio thuan (van nghe duoc, mat xu ly ngat quang).
   static Future<void> configureSession() async {
     if (kIsWeb) return;
-    final session = await AudioSession.instance;
-    await session.configure(const AudioSessionConfiguration.speech());
+    try {
+      final session = await AudioSession.instance.timeout(
+        const Duration(seconds: 8),
+      );
+      await session.configure(const AudioSessionConfiguration.speech()).timeout(
+        const Duration(seconds: 8),
+      );
+    } catch (e) {
+      debugPrint('[audio] configureSession bo qua (fail-open): $e');
+    }
   }
 }
